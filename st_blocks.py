@@ -38,10 +38,11 @@ def hero(missing: list[str]) -> str:
     return f"""
 <div class="ra-hero">
   {banner}
-  <span class="ra-hero-pill"><span class="ra-dot ok"></span>search · read · write · critique</span>
-  <h1>Research anything.<br><em class="ra-gradient">Cited &amp; critiqued.</em></h1>
-  <p>An agent that searches the web, reads the strongest sources, writes a cited report,
-  then has a strict editor score it. Follow-ups remember the session.</p>
+  <span class="ra-hero-pill"><span class="ra-dot ok"></span>chat · search · read · write · critique</span>
+  <h1>Ask anything. <span class="ra-accent">Research it properly.</span></h1>
+  <p>Type <b>cricket</b> and it chats. Type <b>research cricket</b> and a team of agents
+  searches the web, reads the strongest sources, writes a cited report, then a strict editor
+  scores it. Follow-ups remember the session.</p>
 </div>"""
 
 
@@ -143,7 +144,7 @@ def sidebar_runs(runs: list[dict]) -> str:
 
 
 def brand() -> str:
-    return '<div class="ra-brand"><span class="ra-orb"></span>researchagent</div>'
+    return '<div class="ra-brand">researchagent</div>'
 
 
 def status(ok: bool, model: str) -> str:

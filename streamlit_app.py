@@ -1,7 +1,9 @@
 """Streamlit front end, the one deployed to Streamlit Community Cloud.
 
 Run locally:  streamlit run streamlit_app.py
-Same pipeline as the CLI and the FastAPI/React app; only the rendering differs.
+
+A message containing the word "research" (e.g. "research cricket") runs the multi-agent
+report pipeline. Anything else (e.g. "cricket") gets a fast chatbot answer.
 """
 
 import os
@@ -30,15 +32,17 @@ except Exception:
 
 import memory  # noqa: E402
 import st_blocks as ui  # noqa: E402
-from pipeline import research_events  # noqa: E402
+from agents import route  # noqa: E402
+from pipeline import chat_reply, research_events  # noqa: E402
 
 REQUIRED_KEYS = ("GROQ_API_KEY", "TAVILY_API_KEY")
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "20"))
+CHAT_LIMIT_PER_HOUR = int(os.getenv("CHAT_LIMIT_PER_HOUR", "120"))
 SUGGESTIONS = [
-    "Impact of AI on healthcare",
-    "State of solid-state batteries",
+    "cricket",
+    "research cricket",
+    "research impact of AI on healthcare",
     "How do GLP-1 drugs work?",
-    "Microplastics in drinking water",
 ]
 CSS = (Path(__file__).parent / "streamlit.css").read_text()
 
@@ -49,25 +53,30 @@ def _rate_windows() -> dict:
     return defaultdict(deque)
 
 
-def rate_limited(client: str) -> bool:
-    now, window = time.time(), _rate_windows()[client]
+def rate_limited(client: str, kind: str = "research") -> bool:
+    limit = RATE_LIMIT_PER_HOUR if kind == "research" else CHAT_LIMIT_PER_HOUR
+    now, window = time.time(), _rate_windows()[(client, kind)]
     while window and now - window[0] > 3600:
         window.popleft()
-    if len(window) >= RATE_LIMIT_PER_HOUR:
+    if len(window) >= limit:
         return True
     window.append(now)
     return False
 
 
-def new_run(topic: str) -> dict:
+def new_run(topic: str, kind: str = "research") -> dict:
     return {
-        "topic": topic, "status": "running", "started": time.time(), "elapsed": 0.0,
+        "kind": kind, "topic": topic, "answer": "", "status": "running", "started": time.time(), "elapsed": 0.0,
         "stages": {k: "pending" for k, _, _ in ui.STAGES}, "log": [], "sources": [],
         "reading": [], "read_urls": [], "report": "", "critique": None, "error": None,
     }
 
 
 def history_run(item: dict) -> dict:
+    if item["kind"] == "chat":
+        run = new_run(item["topic"], "chat")
+        run.update(status="history", answer=item["answer"])
+        return run
     run = new_run(item["topic"])
     run.update(status="history", stages={k: "done" for k, _, _ in ui.STAGES},
                sources=item["sources"], read_urls=item["read_urls"], report=item["report"],
@@ -108,7 +117,34 @@ def apply_event(run: dict, ev: dict) -> None:
         run["log"].append("stopped")
 
 
+def render_chat(run: dict) -> None:
+    with st.chat_message("user"):
+        st.markdown(run["topic"])
+    with st.chat_message("assistant"):
+        if run["error"]:
+            st.html(ui.error(run["error"]))
+        else:
+            st.markdown(run["answer"])
+
+
+def stream_chat(prompt: str, session_id: str) -> dict:
+    run = new_run(prompt, "chat")
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    with st.chat_message("assistant"):
+        try:
+            run["answer"] = st.write_stream(chat_reply(prompt, session_id))
+            run["status"] = "done"
+        except Exception as e:
+            run["status"], run["error"] = "error", str(e) or e.__class__.__name__
+            st.html(ui.error(run["error"]))
+    return run
+
+
 def render_run(run: dict, idx: int) -> None:
+    if run["kind"] == "chat":
+        render_chat(run)
+        return
     st.html(ui.topic(run["topic"]))
     if run["status"] != "history":
         st.html(ui.pipeline(run))
@@ -185,14 +221,18 @@ with st.sidebar:
         st.session_state.runs = []
         st.query_params["s"] = st.session_state.session_id
         st.rerun()
-    if runs:
-        st.html(ui.sidebar_runs(runs))
+    reports = [r for r in runs if r["kind"] == "research"]
+    if reports:
+        st.html(ui.sidebar_runs(reports))
+    st.caption('Tip: type **cricket** to chat, or **research cricket** for a cited report.')
     st.html(ui.status(not missing, os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")))
 
 topic = st.chat_input(
-    "Ask a follow-up — this session is remembered…" if runs else "What do you want to research?",
+    "Ask a follow-up, or start with “research” for a cited report…" if runs
+    else "Chat about anything, or type “research <topic>” for a report…",
     max_chars=300,
     disabled=bool(missing),
+    key="prompt",  # stable identity even though the placeholder text changes
 )
 topic = topic or st.session_state.pop("suggested", None)
 
@@ -213,13 +253,20 @@ for i, r in enumerate(runs):
 
 if topic and (topic := topic.strip()):
     client = st.context.ip_address or session_id
-    if len(topic) < 2:
+    mode, text = route(topic)
+    if mode == "research" and len(text) < 2:
+        st.toast("Tell me what to research, e.g. “research cricket”.")
+    elif len(text) < 1:
         st.toast("Give the agent a little more to go on.")
-    elif rate_limited(client):
-        st.html(ui.error(f"Limit of {RATE_LIMIT_PER_HOUR} reports per hour reached. Try again later."))
+    elif rate_limited(client, mode):
+        limit = RATE_LIMIT_PER_HOUR if mode == "research" else CHAT_LIMIT_PER_HOUR
+        st.html(ui.error(f"Limit of {limit} {mode} requests per hour reached. Try again later."))
+    elif mode == "chat":
+        with st.container(key=f"run_{len(runs)}"):
+            runs.append(stream_chat(text, session_id))
     else:
         with st.container(key=f"run_{len(runs)}"):
-            finished = stream_run(topic, session_id, len(runs))
+            finished = stream_run(text, session_id, len(runs))
         runs.append(finished)
         if finished["status"] == "done":
             st.rerun()  # refresh the sidebar list and swap live placeholders for static blocks

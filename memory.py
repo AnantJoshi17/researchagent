@@ -45,6 +45,16 @@ def _connect() -> sqlite3.Connection:
         )"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session ON reports(session_id, id)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_session ON chats(session_id, id)")
     return conn
 
 
@@ -60,13 +70,45 @@ def save_report(session_id: str, topic: str, report: str, sources: list, read_ur
         return cur.lastrowid
 
 
+def save_chat(session_id: str, prompt: str, answer: str) -> int:
+    with _lock, _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO chats (session_id, prompt, answer, created_at) VALUES (?, ?, ?, ?)",
+            (session_id, prompt, answer, time.time()),
+        )
+        return cur.lastrowid
+
+
+def chat_history(session_id: str, limit: int = 6) -> list[dict]:
+    """The last few chat turns as LLM messages, oldest first."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT prompt, answer FROM chats WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    messages = []
+    for r in reversed(rows):
+        messages += [{"role": "user", "content": r["prompt"]},
+                     {"role": "assistant", "content": r["answer"]}]
+    return messages
+
+
 def get_history(session_id: str) -> list[dict]:
+    """Every chat turn and report in the session, in the order they happened."""
     with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM reports WHERE session_id = ? ORDER BY id", (session_id,)
         ).fetchall()
-    return [
+        chats = conn.execute(
+            "SELECT * FROM chats WHERE session_id = ? ORDER BY id", (session_id,)
+        ).fetchall()
+    items = [
+        {"kind": "chat", "topic": c["prompt"], "answer": c["answer"], "created_at": c["created_at"]}
+        for c in chats
+    ]
+    items += [
         {
+            "kind": "research",
             "id": r["id"],
             "topic": r["topic"],
             "report": r["report"],
@@ -77,11 +119,13 @@ def get_history(session_id: str) -> list[dict]:
         }
         for r in rows
     ]
+    return sorted(items, key=lambda i: i["created_at"])
 
 
 def clear_session(session_id: str) -> None:
     with _lock, _db() as conn:
         conn.execute("DELETE FROM reports WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM chats WHERE session_id = ?", (session_id,))
 
 
 def memory_context(session_id: str | None) -> str:

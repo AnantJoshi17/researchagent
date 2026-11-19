@@ -17,11 +17,16 @@ os.environ.setdefault("DB_PATH", "data/demo.db")
 
 import pipeline  # noqa: E402
 
-SOURCES = """1. Artificial intelligence in healthcare: past, present and future - https://pmc.ncbi.nlm.nih.gov/articles/PMC5829945/ - Widely cited review of clinical AI
-2. WHO guidance on ethics & governance of AI for health - https://www.who.int/publications/i/item/9789240029200 - Global policy framework
-3. AI in radiology: opportunities and challenges - https://www.nature.com/articles/s41568-018-0016-5 - Diagnostic imaging deep dive
-4. The potential for artificial intelligence in healthcare - https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6616181/ - Adoption barriers and outlook
-5. How AI is changing hospital operations - https://hbr.org/2023/ai-in-hospitals - Operational efficiency case studies"""
+RESULTS = [
+    {"title": "Artificial intelligence in healthcare: past, present and future",
+     "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC5829945/", "snippet": "Widely cited review of clinical AI"},
+    {"title": "WHO guidance on ethics & governance of AI for health",
+     "url": "https://www.who.int/publications/i/item/9789240029200", "snippet": "Global policy framework"},
+    {"title": "AI in radiology: opportunities and challenges",
+     "url": "https://www.nature.com/articles/s41568-018-0016-5", "snippet": "Diagnostic imaging deep dive"},
+    {"title": "The potential for artificial intelligence in healthcare",
+     "url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6616181/", "snippet": "Adoption barriers and outlook"},
+]
 
 REPORT = """## Introduction
 Artificial intelligence is moving from research labs into everyday clinical work, from reading scans to triaging patients. The sources agree on its promise but differ on how fast safe adoption can happen.
@@ -39,21 +44,22 @@ Artificial intelligence is moving from research labs into everyday clinical work
 """
 
 
-def fake_search(topic, memory=""):
-    for q in (topic, f"{topic} latest research 2026"):
-        time.sleep(0.9)
-        yield "tool_call", {"name": "web_search", "args": {"query": q}}
-    time.sleep(1.2)
-    yield "final", SOURCES
+def fake_search(query):
+    time.sleep(0.8)
+    return [{**r, "text": "page text " * 50} for r in RESULTS]
 
 
-def fake_reader(topic, sources):
-    urls = [line.split(" - ")[1] for line in SOURCES.splitlines()[:3]]
-    for u in urls:
-        time.sleep(0.8)
-        yield "tool_call", {"name": "scrape_url", "args": {"url": u}}
-    time.sleep(1.5)
-    yield "final", "\n".join(f"SOURCE: {u}\nnotes..." for u in urls)
+def fake_read(results):
+    time.sleep(0.8)
+    return results[:3]
+
+
+def fake_chat(prompt, history, memory=""):
+    answer = (f"Here's a quick take on **{prompt}**. This is demo mode, so the answer is canned. "
+              f"Type **research {prompt}** to see the full report pipeline animate.")
+    for word in answer.split(" "):
+        time.sleep(0.03)
+        yield word + " "
 
 
 def fake_writer(*args):
@@ -72,8 +78,10 @@ def fake_critic(*args):
     }
 
 
-pipeline.stream_search_agent = fake_search
-pipeline.stream_reader_agent = fake_reader
+pipeline.agents.search = fake_search
+pipeline.agents.read = fake_read
+pipeline.agents.stream_chat = fake_chat
+pipeline.agents.standalone_query = lambda topic, memory="": topic
 pipeline.stream_writer_chain = fake_writer
 pipeline.run_critic_chain = fake_critic
 

@@ -1,98 +1,145 @@
-import os
-from typing import Iterator
+"""The agents. Only the ones that need judgement call the LLM:
 
-from langchain.agents import create_agent
-from langchain_core.messages import AIMessage
+    router  -> decides chat vs research (keyword rule, no LLM call, instant)
+    chat    -> LLM, streams a conversational answer
+    search  -> Tavily (no LLM)
+    reader  -> reads the top pages in parallel (no LLM)
+    writer  -> LLM, streams the cited report      (chains.py)
+    critic  -> LLM, scores the report out of 10   (chains.py)
+
+Search and reader used to be LLM tool-calling agents. Doing them directly cuts a report from
+about six sequential LLM calls to two, which is most of the speed-up.
+"""
+
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterator
+from urllib.parse import urlparse
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
-from tools import scrape_url, web_search
+import tools
 
-# How many pages the reader scrapes per report. Each page is capped at MAX_PAGE_CHARS in
-# tools.py, so this is the main lever on tokens per run (and on Groq's per-minute budget).
+# How many pages the reader passes to the writer. Each is capped at MAX_PAGE_CHARS in tools.py.
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "3"))
+MIN_PAGE_CHARS = 400   # below this, Tavily's text is too thin and we scrape the page ourselves
 
 
 def get_llm(temperature: float = 0.3) -> ChatGroq:
-    # A small model by default: each report makes several sequential LLM calls, and on
-    # larger models that exhausts Groq's free tokens-per-minute budget, so the SDK backs
-    # off mid-run and the total time roughly triples.
-    return ChatGroq(
-        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
-        api_key=os.getenv("GROQ_API_KEY"),
-        temperature=temperature,
-    )
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    extra = {}
+    # gpt-oss and qwen are reasoning models. Low effort keeps answers good and cuts the
+    # "thinking" time before the first token by a lot. Other models reject the parameter.
+    if model.startswith(("openai/gpt-oss", "qwen")):
+        extra["reasoning_effort"] = os.getenv("GROQ_REASONING_EFFORT", "low")
+    return ChatGroq(model=model, api_key=os.getenv("GROQ_API_KEY"), temperature=temperature,
+                    max_retries=2, **extra)
 
 
-def _stream_agent(agent, prompt: str) -> Iterator[tuple[str, object]]:
-    """Run an agent graph, yielding ("tool_call", {name, args}) as the model requests
-    tools and finally ("final", text). Lets callers show progress mid-run."""
-    final = ""
-    for update in agent.stream(
-        {"messages": [{"role": "user", "content": prompt}]}, stream_mode="updates"
-    ):
-        for node_state in update.values():
-            for msg in (node_state or {}).get("messages", []):
-                if not isinstance(msg, AIMessage):
-                    continue
-                for call in msg.tool_calls or []:
-                    yield "tool_call", {"name": call["name"], "args": call["args"]}
-                if msg.content and not msg.tool_calls:
-                    final = msg.content
-    yield "final", final
+# ---------------------------------------------------------------- router
+
+RESEARCH_WORD = re.compile(r"\bresearch\b", re.IGNORECASE)
+LEADING_FILLER = re.compile(
+    r"^(?:(?:please|can|could|would|will|you|kindly|do|make|write|give|me|a|an|some|"
+    r"deep|full|detailed|report|on|about|into|for|of|regarding|the topic|topic)\b[\s,:\-]*)+",
+    re.IGNORECASE,
+)
 
 
-def _run_agent(agent, prompt: str) -> str:
-    return next(v for kind, v in _stream_agent(agent, prompt) if kind == "final")
+def route(prompt: str) -> tuple[str, str]:
+    """("research", topic) when the prompt contains the word "research", else ("chat", prompt).
+
+    "research cricket"                  -> ("research", "cricket")
+    "do a research report on cricket"   -> ("research", "cricket")
+    "cricket"                           -> ("chat", "cricket")
+    """
+    prompt = prompt.strip()
+    if not RESEARCH_WORD.search(prompt):
+        return "chat", prompt
+    topic = RESEARCH_WORD.sub(" ", prompt)
+    topic = " ".join(topic.split())
+    topic = LEADING_FILLER.sub("", topic).strip(" ,:-?.!")
+    topic = re.sub(r"\s+report$", "", topic, flags=re.IGNORECASE).strip()
+    return "research", topic
 
 
-def _search_agent():
-    return create_agent(
-        model=get_llm(),
-        tools=[web_search],
-        system_prompt=(
-            "You are a research search specialist. Call web_search once or twice with "
-            "well-chosen queries, then list the most useful sources, each on its own line as "
-            "'Title - URL - one line on why it matters'. Do not write a report, only list sources. "
-            "If you are given earlier research from this session and the new request is a "
-            "follow-up (it says 'it', 'that', 'compare', etc.), resolve what it refers to "
-            "before choosing search queries."
-        ),
-    )
+# ---------------------------------------------------------------- chat agent
+
+CHAT_SYSTEM = (
+    "You are a friendly, concise research assistant chatting with a user. Answer helpfully in "
+    "a few short paragraphs or bullets. If the user would benefit from a full cited report, "
+    "mention they can start their message with the word \"research\" (for example "
+    "\"research {example}\")."
+)
 
 
-def _reader_agent():
-    return create_agent(
-        model=get_llm(),
-        tools=[scrape_url],
-        system_prompt=(
-            f"You are a research reader. Given a list of sources, pick the {MAX_SOURCES} most "
-            "relevant and substantial URLs from different sites and call scrape_url on each "
-            "(you may call them in parallel). If a page fails or comes back empty, replace it "
-            "with the next best URL once. Then write detailed notes on each page you read: key "
-            "facts, figures and quotes. Start each page's notes with the line "
-            "'SOURCE: <the url you read>'. Note where sources agree or disagree."
-        ),
-    )
-
-
-def search_prompt(topic: str, memory: str = "") -> str:
-    prompt = f"Find sources on: {topic}"
+def stream_chat(prompt: str, history: list[dict], memory: str = "") -> Iterator[str]:
+    """history: earlier chat turns as [{"role": "user"|"assistant", "content": str}]."""
+    system = CHAT_SYSTEM.format(example=prompt[:40] or "cricket")
     if memory:
-        prompt = f"Earlier research in this session:\n{memory}\n\n{prompt}"
-    return prompt
+        system += f"\n\nReports researched earlier in this session:\n{memory}"
+    messages = [SystemMessage(system)]
+    for turn in history[-6:]:
+        cls = HumanMessage if turn["role"] == "user" else AIMessage
+        messages.append(cls(turn["content"]))
+    messages.append(HumanMessage(prompt))
+    for chunk in get_llm(temperature=0.5).stream(messages):
+        if chunk.content:
+            yield chunk.content
 
 
-def stream_search_agent(topic: str, memory: str = ""):
-    return _stream_agent(_search_agent(), search_prompt(topic, memory))
+# ---------------------------------------------------------------- query rewrite (follow-ups only)
+
+def standalone_query(topic: str, memory: str) -> str:
+    """Turn a follow-up like "its economic impact" into a full search query. Only called when
+    the session already has reports, so first questions skip this LLM call."""
+    if not memory:
+        return topic
+    msg = get_llm(temperature=0).invoke([
+        SystemMessage(
+            "Rewrite the user's research request as one standalone web search query. If it refers "
+            "to earlier research (it, that, they, compare...), name the subject explicitly. "
+            "Reply with the query only, under 15 words."
+        ),
+        HumanMessage(f"Earlier research:\n{memory}\n\nRequest: {topic}"),
+    ])
+    query = " ".join(str(msg.content).split()).strip("\"'")
+    return query or topic
 
 
-def stream_reader_agent(topic: str, sources: str):
-    return _stream_agent(_reader_agent(), f"Topic: {topic}\n\nSources:\n{sources}")
+# ---------------------------------------------------------------- search and reader agents
+
+def search(query: str) -> list[dict]:
+    return tools.web_search(query, max_results=max(5, MAX_SOURCES + 2))
 
 
-def run_search_agent(topic: str, memory: str = "") -> str:
-    return _run_agent(_search_agent(), search_prompt(topic, memory))
+def _read_one(result: dict) -> dict:
+    text = result["text"]
+    if len(text) < MIN_PAGE_CHARS:
+        text = tools.scrape_url(result["url"]) or text or result["snippet"]
+    return {**result, "text": text}
 
 
-def run_reader_agent(topic: str, sources: str) -> str:
-    return _run_agent(_reader_agent(), f"Topic: {topic}\n\nSources:\n{sources}")
+def _diverse(results: list[dict]) -> list[dict]:
+    """Put one result per website first, so the report isn't built from a single site."""
+    seen, first, rest = set(), [], []
+    for r in results:
+        host = (urlparse(r["url"]).hostname or "").removeprefix("www.")
+        (rest if host in seen else first).append(r)
+        seen.add(host)
+    return first + rest
+
+
+def read(results: list[dict]) -> list[dict]:
+    """Read the top MAX_SOURCES pages in parallel, skipping ones that come back empty."""
+    results = _diverse(results)
+    with ThreadPoolExecutor(max_workers=max(1, len(results))) as pool:
+        pages = list(pool.map(_read_one, results))
+    good = [p for p in pages if len(p["text"]) >= 200]
+    return (good or pages)[:MAX_SOURCES]
+
+
+def notes_from(pages: list[dict]) -> str:
+    return "\n\n".join(f"SOURCE: {p['url']}\nTITLE: {p['title']}\n{p['text']}" for p in pages)

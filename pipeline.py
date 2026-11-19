@@ -1,80 +1,41 @@
-import re
 import time
 from typing import Iterator
 
+import agents
 import memory
-from agents import stream_reader_agent, stream_search_agent
 from chains import run_critic_chain, stream_writer_chain
-
-URL_RE = re.compile(r"https?://[^\s<>\")\]]+")
-
-
-def parse_sources(text: str) -> list[dict]:
-    """Turn the search agent's 'Title - URL - why' lines into structured cards. The model
-    doesn't always follow the format exactly, so anything with a URL on it counts."""
-    items, seen = [], set()
-    for line in text.splitlines():
-        m = URL_RE.search(line)
-        if not m:
-            continue
-        url = m.group(0).rstrip(".,;:")
-        if url in seen:
-            continue
-        seen.add(url)
-        before, after = line[: m.start()], line[m.end():]
-        title = re.sub(r"^[\s\-*\d.)#|]+", "", before)          # list markers / numbering
-        title = re.sub(r"[\s\-–—:|(\[]+$", "", title)            # trailing separators
-        title = title.replace("**", "").strip(" []")
-        why = re.sub(r"^[\s)\]\-–—:|]+", "", after).replace("**", "").strip()
-        items.append({"title": title or url, "url": url, "why": why})
-    return items
-
-
-def _read_urls(notes: str, attempted: list[str]) -> list[str]:
-    # Prefer the pages the reader actually reported on; fall back to what it tried.
-    reported = [u.rstrip(".,;:") for u in re.findall(r"SOURCE:\s*(\S+)", notes)]
-    return list(dict.fromkeys(reported or attempted))
 
 
 def research_events(topic: str, session_id: str | None = None) -> Iterator[dict]:
-    """Run the full pipeline, yielding progress events the CLI and web UI both render."""
+    """Run search -> read -> write -> critique, yielding progress events the CLI and the web
+    UI both render. Only the writer and the critic call the LLM (plus one short query rewrite
+    for follow-ups), so a report takes a few seconds instead of a minute."""
     started = time.time()
     try:
         past = memory.memory_context(session_id)
 
         yield {"type": "stage", "stage": "search", "status": "active"}
-        sources_text = ""
-        for kind, value in stream_search_agent(topic, past):
-            if kind == "tool_call" and value["name"] == "web_search":
-                yield {"type": "query", "query": value["args"].get("query", "")}
-            elif kind == "final":
-                sources_text = value
-        sources = parse_sources(sources_text)
-        if not sources:
+        query = agents.standalone_query(topic, past)
+        yield {"type": "query", "query": query}
+        results = agents.search(query)
+        if not results:
             raise RuntimeError("The search step found no usable sources. Try rephrasing the topic.")
+        sources = [{"title": r["title"], "url": r["url"], "why": r["snippet"]} for r in results]
         yield {"type": "sources", "items": sources}
         yield {"type": "stage", "stage": "search", "status": "done"}
 
         yield {"type": "stage", "stage": "read", "status": "active"}
-        notes, attempted = "", []
-        for kind, value in stream_reader_agent(topic, sources_text):
-            if kind == "tool_call" and value["name"] == "scrape_url":
-                url = value["args"].get("url", "")
-                attempted.append(url)
-                yield {"type": "reading", "url": url}
-            elif kind == "final":
-                notes = value
-        read_urls = _read_urls(notes, attempted)
-        known = {s["url"] for s in sources}
-        extra = [{"title": u, "url": u, "why": ""} for u in read_urls if u not in known]
-        if extra:
-            sources += extra
-            yield {"type": "sources", "items": sources}
+        for r in agents._diverse(results)[: agents.MAX_SOURCES]:
+            yield {"type": "reading", "url": r["url"]}
+        pages = agents.read(results)
+        read_urls = [p["url"] for p in pages]
+        notes = agents.notes_from(pages)
         yield {"type": "read_done", "urls": read_urls}
         yield {"type": "stage", "stage": "read", "status": "done"}
 
-        # The writer never sees the raw web, only what the reader chose to pass on.
+        # The writer never sees the raw web, only the pages the reader chose.
         yield {"type": "stage", "stage": "write", "status": "active"}
+        sources_text = "\n".join(f"- {s['title']} - {s['url']}" for s in sources)
         report = ""
         for chunk in stream_writer_chain(topic, sources_text, notes, past):
             report += chunk
@@ -94,6 +55,17 @@ def research_events(topic: str, session_id: str | None = None) -> Iterator[dict]
         yield {"type": "error", "message": str(e) or e.__class__.__name__}
 
 
+def chat_reply(prompt: str, session_id: str | None = None) -> Iterator[str]:
+    """Stream a chat answer, then store the turn in session memory."""
+    history = memory.chat_history(session_id) if session_id else []
+    answer = ""
+    for chunk in agents.stream_chat(prompt, history, memory.memory_context(session_id)):
+        answer += chunk
+        yield chunk
+    if session_id and answer:
+        memory.save_chat(session_id, prompt, answer)
+
+
 STAGE_LABELS = {
     "search": "[1/4] Searching the web...",
     "read": "[2/4] Reading the best sources...",
@@ -102,10 +74,10 @@ STAGE_LABELS = {
 }
 
 
-def run_research(topic: str) -> str:
-    """CLI entry point: prints progress and returns the report with the critique appended."""
+def run_research(topic: str, session_id: str | None = None) -> str:
+    """CLI: prints progress and returns the report with the critique appended."""
     report, critique = "", None
-    for ev in research_events(topic):
+    for ev in research_events(topic, session_id):
         if ev["type"] == "stage" and ev["status"] == "active":
             print(STAGE_LABELS[ev["stage"]])
         elif ev["type"] == "reading":
@@ -114,6 +86,8 @@ def run_research(topic: str) -> str:
             report += ev["text"]
         elif ev["type"] == "critique":
             critique = ev
+        elif ev["type"] == "done":
+            print(f"      done in {ev['elapsed']}s")
         elif ev["type"] == "error":
             raise RuntimeError(ev["message"])
 
